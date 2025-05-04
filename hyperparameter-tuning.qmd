@@ -1,0 +1,278 @@
+---
+title: "ESS 330 - Lab 8: Machine Learning"
+author: "Ava Zelenz"
+date: "04/16/2025"
+format: html
+execute:
+  echo: true
+---
+
+## I. Set Up Lab
+
+### 1. Library Code
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(glue)
+library(vip)
+library(baguette)
+library(patchwork)
+```
+
+### 2. Data Import
+
+```{r}
+root  <- 'https://gdex.ucar.edu/dataset/camels/file'
+
+download.file('https://gdex.ucar.edu/dataset/camels/file/camels_attributes_v2.0.pdf', 
+              'data/camels_attributes_v2.0.pdf')
+
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+
+remote_files  <- glue('{root}/camels_{types}.txt')
+
+local_files   <- glue('data/camels_{types}.txt')
+
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+
+camels <- map(local_files, read_delim, show_col_types = FALSE) 
+
+camels <- power_full_join(camels ,by = 'gauge_id')
+```
+
+### 3. Data Cleaning and Splitting into Test/Train Datasets
+
+```{r}
+camels <- camels |> 
+  mutate(logQmean = log(q_mean))
+
+visdat::vis_dat(camels)
+
+camels <- camels |>
+  drop_na()
+
+set.seed(123)
+camels_split <- initial_split(camels, prop = .8, strata = q_mean)
+
+camels_training <- training(camels_split)
+camels_testing <- testing(camels_split)
+
+```
+
+## II. Resampling and Model Testing
+
+### 1. Recipe and Data Baking
+
+```{r}
+# Recipe
+rec <- recipe(logQmean ~ soil_porosity + soil_depth_pelletier + gauge_lat + gauge_lon, data = camels_training) |>
+  update_role(gauge_lat, gauge_lon, new_role = "id") |> 
+  step_log(all_predictors(), offset = 1e-6) |>
+  step_naomit(all_predictors(), all_outcomes())
+
+# Baking Data
+baked_data <- prep(rec, camels_training) |> 
+  bake(new_data = NULL)
+
+```
+
+### 2. Building Resamples and 3 Models
+
+```{r}
+# Cross Validation
+fold_camels <- vfold_cv(camels_training, v = 10)
+
+# Linear Model
+lm_model <- linear_reg() |>
+  set_engine("lm") |>
+  set_mode("regression")
+
+# Random Forest
+rf_model <- rand_forest() |>
+  set_engine("ranger", importance = "impurity") |>
+  set_mode("regression")
+
+# Decision Tree
+dt_model <- decision_tree() |>
+  set_engine("rpart") |>
+  set_mode("regression")
+
+```
+
+### 3. Workflow Set and Testing Models
+
+```{r}
+# Workflow Model List
+model_list <- list(
+  linear = lm_model,
+  random_forest = rf_model,
+  decision_tree = dt_model
+)
+
+# Workflow
+camels_workflows <- workflow_set(
+  preproc = list(basic_recipe = rec),
+  models = model_list
+)
+
+# Fit to resamples
+results <- camels_workflows |>
+  workflow_map("fit_resamples", resamples = fold_camels)
+
+# Visualize
+autoplot(results)
+```
+
+### 4. Model Selection
+
+#### The model that will best fit is the linear_reg model. The model's range of rmse is lowest and has a decent rsq, meaning that it is making the most accurate predictions and performs the best out of the three.
+
+#### **Model Selected**: Linear Regression
+>
+> **Engine**: "lm"
+>
+> **Mode**: "Regression"
+>
+> **Reason for choice**: high accuracy of predictions and simple results based on variable connection.
+
+## III. Model Tuning
+
+### 1. Building a Model for Chosen Specification
+
+```{r}
+# Linear Model with Hyperparameters
+
+tuned_lm_model <- linear_reg(
+  penalty = tune(), 
+  mixture = tune()
+) |> 
+  set_engine("glmnet") |> 
+  set_mode("regression")
+
+lm_workflow <- workflow() |> 
+  add_model(tuned_lm_model) |> 
+  add_recipe(rec)
+
+# Checking Tunable Values and Ranges
+dials <- extract_parameter_set_dials(lm_workflow)
+
+dials$object
+```
+
+### 2. Define the Search Space and Tuning Model
+
+```{r}
+library(glmnet)
+my.grid <- grid_space_filling(
+  dials,
+  size = 25
+)
+
+my.grid
+
+model_params <-  tune_grid(
+    lm_workflow,
+    resamples = fold_camels,
+    grid = my.grid,
+    metrics = metric_set(rmse, rsq, mae),
+    control = control_grid(save_pred = TRUE)
+  )
+
+autoplot(model_params)
+```
+
+#### The model maintains consistent performance across a range of regularization strengths but experiences a notable decline when the penalty becomes very small. This indicates that regularization is crucial for maintaining stability and accuracy, although the specific form of regularization has minimal impact on performance in this scenario.
+
+### 3. Check Skill of Tuned Model
+
+```{r}
+collect_metrics(model_params)
+
+show_best(model_params, metric = "mae", n = 1)
+
+hp_best <- select_best(model_params, metric = "mae")
+```
+
+#### The best model is mixture, as it's value for MAE is lower, it can make more accurate predictions and is a good fit for the data. The preprocessors' config is Preprocessor1_Model06.
+
+### 4. Finalizing the Model
+
+```{r}
+finalized_workflow <- finalize_workflow(
+  lm_workflow,
+  hp_best
+)
+
+final_fit <- fit(finalized_workflow, data = camels_training)
+
+final_res <- last_fit(finalized_workflow, split = camels_split)
+
+collect_metrics(final_res)
+
+collect_predictions(final_res)
+```
+
+> **Metrics and Model Analyses**
+
+#### Although the RMSE is 1.2, indicating that the predictions are reasonably close to the observed values, the very low R² suggests the model fails to capture much of the underlying variability. This implies that the selected predictors—soil porosity and depth to bedrock—are not particularly effective for modeling q_mean.
+
+### 5. Creating a Scatterplot
+
+```{r}
+
+final_res |> 
+  collect_predictions() |> 
+  ggplot(aes(x = .pred, y = logQmean)) +
+  geom_smooth(method = "lm",  color = "#53868B") +
+  geom_point(alpha = 0.6, color = "#2F4F4F") +
+  geom_abline(slope = 1, intercept = 0, color = "#FF6EB4", linetype = "dashed") +
+  scale_color_viridis_c(option = "plasma") +
+  labs(
+    x = "Predicted",
+    y = "Actual",
+    title = "Actual vs Predicted Values for Q_mean\nwith Predictors of Soil Porosity and Soil Depth\nto Bedrock"
+  ) +
+  theme_minimal()
+
+```
+
+## IV. Building A Map and Full Data Prediction
+
+```{r}
+
+full_fit <- fit(finalized_workflow, data = camels)
+
+aug_data <- augment(full_fit, new_data = camels)
+
+aug_data <- aug_data |>
+  mutate(residuals = (logQmean - .pred)^2)
+```
+
+### GGplot Maps
+
+```{r}
+# Map of Predictions
+map_pred <- ggplot(aug_data, aes(x = gauge_lon, y = gauge_lat, color = .pred)) +
+  geom_point(size = 2) +
+  coord_fixed() +
+  scale_color_viridis_c(option = "plasma", name = "Predicted\nlogQmean") +
+  labs(title = "Predicted logQmean") +
+  theme_classic(base_size = 3)
+
+# Map of Residuals
+map_resid <- ggplot(aug_data, aes(x = gauge_lon, y = gauge_lat, color = residuals)) +
+  geom_point(size = 2) +
+  coord_fixed() +
+  scale_color_viridis_c(option = "inferno", name = "Residuals\n(Squared)") +
+  labs(title = "Residuals (Squared Error)") +
+  theme_classic(base_size = 3)
+
+# Combine the two maps using patchwork
+final_plot <- map_pred | map_resid +
+  plot_annotation(title = "Predictions and Residuals Across Sites")
+
+# Display
+final_plot
+```
